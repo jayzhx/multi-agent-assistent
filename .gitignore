@@ -1,0 +1,73 @@
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+*$py.class
+
+# =========================
+# Virtual Environment
+# =========================
+.venv/
+venv/
+env/
+
+# =========================
+# Environment Variables
+# =========================
+.env
+.env.local
+.env.*.local
+!.env.example
+
+# =========================
+# Packaging / Build
+# =========================
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# =========================
+# Test / Coverage / Cache
+# =========================
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.nox/
+
+# =========================
+# Jupyter / IPython
+# =========================
+.ipynb_checkpoints/
+profile_default/
+ipython_config.py
+
+# =========================
+# IDE / Editor
+# =========================
+.idea/
+.vscode/
+
+# =========================
+# OS Files
+# =========================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# =========================
+# Logs
+# =========================
+*.log
+logs/
+
+# =========================
+# Local Runtime
