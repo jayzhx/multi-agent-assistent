@@ -3,6 +3,7 @@ import sqlite3
 import uuid
 import re
 import requests
+from pathlib import Path
 from tqdm import tqdm
 from qdrant_client import QdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
@@ -15,6 +16,7 @@ import aiohttp
 from tqdm.asyncio import tqdm_asyncio
 from more_itertools import chunked
 import time
+from docx import Document
 
 settings = get_settings()
 
@@ -113,13 +115,59 @@ class VectorDB:
                 logger.info(f"当前使用本地 embedding 模型，维度为 {embedding_size}")
                 return embedding_size
             else:
-                # API embedding 默认按常见 OpenAI 维度处理
-                # text-embedding-3-small: 1536, text-embedding-3-large: 3072, ada-002: 1536
-                return 1536
+                # 优先通过真实请求探测当前 API embedding 维度，避免与实际模型不一致
+                test_embedding = generate_embedding("维度探测")
+                embedding_size = len(test_embedding)
+                logger.info(f"当前使用 API embedding 模型，维度为 {embedding_size}")
+                return embedding_size
         except Exception as e:
             logger.warning(f"无法确定 embedding 维度: {str(e)}")
             logger.info("默认使用 1536 维")
             return 1536
+
+    def load_local_faq_documents(self):
+        """优先从本地 FAQ 目录读取知识库文件。"""
+        faq_dir = Path("faq_documents")
+        if not faq_dir.exists():
+            logger.info("未找到本地 FAQ 目录 faq_documents，将使用远程 FAQ 数据源。")
+            return []
+
+        docs = []
+        supported_patterns = ("*.md", "*.txt", "*.docx")
+        file_paths = []
+        for pattern in supported_patterns:
+            file_paths.extend(sorted(faq_dir.glob(pattern)))
+
+        for file_path in file_paths:
+            try:
+                if file_path.suffix.lower() in {".md", ".txt"}:
+                    content = file_path.read_text(encoding="utf-8").strip()
+                elif file_path.suffix.lower() == ".docx":
+                    document = Document(file_path)
+                    content = "\n".join(
+                        paragraph.text.strip()
+                        for paragraph in document.paragraphs
+                        if paragraph.text.strip()
+                    ).strip()
+                else:
+                    continue
+
+                if not content:
+                    logger.warning(f"本地 FAQ 文件为空，已跳过: {file_path}")
+                    continue
+
+                docs.append(
+                    {
+                        "page_content": content,
+                        "source": str(file_path),
+                    }
+                )
+                logger.info(f"已加载本地 FAQ 文件: {file_path}")
+            except Exception as e:
+                logger.error(f"读取本地 FAQ 文件失败 {file_path}: {str(e)}")
+
+        logger.info(f"共加载 {len(docs)} 个本地 FAQ 文件")
+        return docs
 
     def format_content(self, data, collection_name):
         # 为不同集合实现对应的内容格式化逻辑
@@ -164,8 +212,8 @@ class VectorDB:
             base_url = base_url[:-3]  # 去掉结尾的 /v1
         embedding_url = f"{base_url}/v1/embeddings"
         
-        # 固定使用 text-embedding-3-small，以保持 1536 维
-        model = 'text-embedding-3-small'
+        # 使用配置中的 embedding 模型
+        model = settings.EMBEDDING_MODEL
         
         logger.info(f"使用的 embedding URL: {embedding_url}")
         logger.info(f"使用的模型: {model}")
@@ -444,29 +492,35 @@ class VectorDB:
         logger.info(f"✅ {self.collection_name} 索引完成，共写入 {total_indexed} 条文档")
 
     async def index_faq_docs(self):
-        faq_url = "https://storage.googleapis.com/benchmarks-artifacts/travel-db/swiss_faq.md"
-        
-        logger.info(f"📄 正在下载 FAQ 内容，来源: {faq_url}")
-        
-        async with aiohttp.ClientSession() as session:
-            try:
-                async with session.get(faq_url) as response:
-                    logger.info(f"📈 FAQ 下载响应状态码: {response.status}")
-                    
-                    if response.status != 200:
-                        error_text = await response.text()
-                        logger.error(f"❌ FAQ 下载失败: HTTP {response.status} - {error_text}")
-                        raise Exception(f"FAQ 下载失败: HTTP {response.status}")
-                    
-                    faq_text = await response.text()
-                    logger.info(f"📝 FAQ 内容下载完成，共 {len(faq_text)} 个字符")
-                    
-            except Exception as e:
-                logger.error(f"💥 下载 FAQ 时出错: {str(e)}")
-                raise
+        local_docs = self.load_local_faq_documents()
+        if local_docs:
+            logger.info("📄 优先使用本地 FAQ 知识库文件进行写入")
+            initial_docs = [doc["page_content"] for doc in local_docs if doc.get("page_content")]
+        else:
+            faq_url = "https://storage.googleapis.com/benchmarks-artifacts/travel-db/swiss_faq.md"
 
-        # 先按标题将 FAQ 拆成多个文档
-        initial_docs = [txt.strip() for txt in re.split(r"(?=\n##)", faq_text) if txt.strip()]
+            logger.info(f"📄 正在下载 FAQ 内容，来源: {faq_url}")
+
+            async with aiohttp.ClientSession() as session:
+                try:
+                    async with session.get(faq_url) as response:
+                        logger.info(f"📈 FAQ 下载响应状态码: {response.status}")
+
+                        if response.status != 200:
+                            error_text = await response.text()
+                            logger.error(f"❌ FAQ 下载失败: HTTP {response.status} - {error_text}")
+                            raise Exception(f"FAQ 下载失败: HTTP {response.status}")
+
+                        faq_text = await response.text()
+                        logger.info(f"📝 FAQ 内容下载完成，共 {len(faq_text)} 个字符")
+
+                except Exception as e:
+                    logger.error(f"💥 下载 FAQ 时出错: {str(e)}")
+                    raise
+
+            # 先按标题将 FAQ 拆成多个文档
+            initial_docs = [txt.strip() for txt in re.split(r"(?=\n##)", faq_text) if txt.strip()]
+
         logger.info(f"📋 FAQ 初步拆分为 {len(initial_docs)} 个部分")
         
         # 对较大的文档继续切分，保证不超过 2048 字符限制
@@ -613,7 +667,7 @@ class VectorDB:
         asyncio.run(self.create_embeddings_async())
 
     async def test_openai_connection(self):
-        """使用简单的 embedding 请求测试 OpenAI API 连接"""
+        """使用当前配置的 embedding 模型测试 API 连接。"""
         logger.info("正在测试 OpenAI API 连接...")
         
         # 修正 embedding API 的 base URL 组装方式
@@ -626,46 +680,15 @@ class VectorDB:
         logger.info(f"Embedding 接口 URL: {embedding_url}")
         
         test_content = "你好，这是一条测试文本。"
-        
-        # 先尝试获取可用模型列表
-        logger.info("正在检查可用模型...")
         available_models = await self.get_available_models()
-        
-        # 优先测试的模型列表
-        primary_models = [
-            "text-embedding-3-small",  # 优先测试的兼容模型
-            "text-embedding-3-large",
-            "text-embedding-ada-002"
-        ]
-        
-        # 额外的兜底模型列表
-        fallback_models = [
-            "embedding-ada-002",  # 某些 API 使用这种命名格式
-            "text-embedding-v1",
-            "embedding-v1",
-            "ada",  # 某些服务商使用短名称
-            "davinci"
-        ]
-        
-        # 合并待测试模型列表
-        models_to_try = []
-        
-        # 如果获取到了可用模型，则优先加入
-        if available_models:
-            models_to_try.extend(available_models)
-            
-        # 加入优先模型
-        for model in primary_models:
+
+        models_to_try = [settings.EMBEDDING_MODEL]
+        for model in available_models:
             if model not in models_to_try:
                 models_to_try.append(model)
-                
-        # 加入兜底模型
-        for model in fallback_models:
-            if model not in models_to_try:
-                models_to_try.append(model)
-        
-        logger.info(f"准备测试 {len(models_to_try)} 个模型: {models_to_try[:8]}...")  # 仅展示前 8 个
-        
+
+        logger.info(f"准备测试 {len(models_to_try)} 个模型，优先使用当前配置模型: {settings.EMBEDDING_MODEL}")
+
         for i, model in enumerate(models_to_try):
             try:
                 logger.info(f"[{i+1}/{len(models_to_try)}] 正在测试模型: {model}")
@@ -683,7 +706,6 @@ class VectorDB:
                             if "data" in result and len(result["data"]) > 0:
                                 embedding = result["data"][0]["embedding"]
                                 logger.info(f"成功！模型 {model} 可用，embedding 维度: {len(embedding)}")
-                                # 保存可用模型，后续可复用
                                 self.working_model = model
                                 return True
                         
@@ -694,8 +716,7 @@ class VectorDB:
                 logger.warning(f"测试模型 {model} 时出错: {type(e).__name__}: {str(e)}")
                 continue
         
-        logger.error(f"已测试的 {len(models_to_try)} 个 embedding 模型全部失败，当前 API 可能不支持 embedding。")
-        logger.error("建议更换 API 服务商，或改用本地 embedding 模型。")
+        logger.error(f"已测试的 {len(models_to_try)} 个 embedding 模型全部失败，当前配置的 embedding 服务不可用。")
         return False
 
     async def get_available_models(self):
@@ -729,13 +750,21 @@ class VectorDB:
 
     def search(self, query, limit=2, with_payload=True):
         query_vector = generate_embedding(query)
-        search_result = self.client.search(
+        if hasattr(self.client, "search"):
+            return self.client.search(
+                collection_name=self.collection_name,
+                query_vector=query_vector,
+                limit=limit,
+                with_payload=with_payload
+            )
+
+        search_result = self.client.query_points(
             collection_name=self.collection_name,
-            query_vector=query_vector,
+            query=query_vector,
             limit=limit,
             with_payload=with_payload
         )
-        return search_result
+        return search_result.points
 
 if __name__ == "__main__":
     vectordb = VectorDB("example_table", "example_collection")
