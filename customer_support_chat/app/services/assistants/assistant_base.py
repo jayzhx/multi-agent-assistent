@@ -8,13 +8,13 @@ from langchain_core.tools import tool
 
 settings = get_settings()
 
-# Initialize the language model (shared among assistants)
+# 初始化语言模型（供各个助手共享）
 llm = ChatOpenAI(
     model=settings.OPENAI_MODEL,
     openai_api_key=settings.OPENAI_API_KEY,
     openai_api_base=settings.OPENAI_BASE_URL if settings.OPENAI_BASE_URL else None,
     temperature=1,
-    max_tokens=settings.MAX_TOKENS,  # Limit tokens to control costs
+    max_tokens=settings.MAX_TOKENS,  # 限制 token 数量以控制成本
 )
 
 # 定义所有助手的基本壳
@@ -37,14 +37,14 @@ class Assistant:
                 break
         return {"messages": result}
 
-# Define the CompleteOrEscalate tool
+# 定义 CompleteOrEscalate 工具
 @tool
 def CompleteOrEscalate(reason: str) -> str:
     """用于将当前任务标记为已完成，或将控制权升级回主助手的工具。
-    
+
     Args:
         reason: 完成或升级的原因
-        
+
     Returns:
         确认操作结果的消息
     """
