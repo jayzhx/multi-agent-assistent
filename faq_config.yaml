@@ -5,7 +5,5 @@ local_sources:
   - name: "default_policies"
     path: "./faq_documents"  # 相对于项目根目录的路径
     file_patterns: 
-      - "*.md"
-      - "*.pdf"
-      - "*.docx"
+      - "shenzhen_faq.md"
     update_interval_hours: 24  # 每24小时检查一次更新
