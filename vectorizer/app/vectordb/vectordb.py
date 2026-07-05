@@ -158,6 +158,106 @@ class VectorDB:
         else:
             return str(data)
 
+    def build_local_faq_entries(self, category, block_title, block_body, source):
+        """将单个 FAQ 区块拆为可直接写库的问答条目。"""
+        entries = []
+        question_pattern = re.compile(r'(?m)^(\d+)\.\s+(.+?[？?])\s*$')
+        question_matches = list(question_pattern.finditer(block_body))
+
+        if not question_matches:
+            content_parts = [f"## {category}"]
+            if block_title:
+                content_parts.append(f"### {block_title}")
+            if block_body:
+                content_parts.append(block_body)
+
+            answer = block_body.strip()
+            question = block_title or category
+            entries.append(
+                {
+                    "page_content": "\n\n".join(part for part in content_parts if part).strip(),
+                    "source": source,
+                    "type": "faq",
+                    "category": category,
+                    "question": question,
+                    "answer": answer,
+                }
+            )
+            return entries
+
+        block_prefix = block_body[:question_matches[0].start()].strip()
+
+        for index, question_match in enumerate(question_matches):
+            question_number = question_match.group(1).strip()
+            question = question_match.group(2).strip()
+            answer_start = question_match.end()
+            answer_end = question_matches[index + 1].start() if index + 1 < len(question_matches) else len(block_body)
+            answer = block_body[answer_start:answer_end].strip()
+
+            content_parts = [f"## {category}"]
+            if block_title:
+                content_parts.append(f"### {block_title}")
+            if index == 0 and block_prefix:
+                content_parts.append(block_prefix)
+            content_parts.append(f"{question_number}. {question}")
+            if answer:
+                content_parts.append(answer)
+
+            entries.append(
+                {
+                    "page_content": "\n\n".join(part for part in content_parts if part).strip(),
+                    "source": source,
+                    "type": "faq",
+                    "category": category,
+                    "question": question,
+                    "answer": answer,
+                }
+            )
+
+        return entries
+
+    def split_local_faq_entries(self, content, source):
+        """按章节、小标题和问答拆分本地 FAQ 文档，提高检索命中精度。"""
+        entries = []
+        section_pattern = re.compile(r'(?ms)^##\s+(.+?)\n(.*?)(?=^##\s+|\Z)')
+        subsection_pattern = re.compile(r'(?ms)^###\s+(.+?)\n(.*?)(?=^###\s+|\Z)')
+
+        for section_match in section_pattern.finditer(content):
+            category = section_match.group(1).strip()
+            section_body = section_match.group(2).strip()
+            subsection_matches = list(subsection_pattern.finditer(section_body))
+
+            if subsection_matches:
+                section_prefix = section_body[:subsection_matches[0].start()].strip()
+                if section_prefix:
+                    entries.extend(self.build_local_faq_entries(category, "", section_prefix, source))
+
+                for subsection_match in subsection_matches:
+                    block_title = subsection_match.group(1).strip()
+                    block_body = subsection_match.group(2).strip()
+                    entries.extend(self.build_local_faq_entries(category, block_title, block_body, source))
+                continue
+
+            entries.extend(self.build_local_faq_entries(category, "", section_body, source))
+
+        if entries:
+            return entries
+
+        cleaned_content = content.strip()
+        if not cleaned_content:
+            return []
+
+        return [
+            {
+                "page_content": cleaned_content,
+                "source": source,
+                "type": "faq",
+                "category": "常见问题",
+                "question": "常规 FAQ 信息",
+                "answer": cleaned_content,
+            }
+        ]
+
     async def generate_embedding_async(self, content, session):
         max_retries = 5
         base_delay = 1
@@ -471,7 +571,9 @@ class VectorDB:
 
         if local_docs:
             logger.info("📄 优先使用本地 FAQ 知识库文件进行写入")
-            initial_docs = [doc["page_content"] for doc in local_docs if doc.get("page_content")]
+            initial_docs = []
+            for doc in local_docs:
+                initial_docs.extend(self.split_local_faq_entries(doc["page_content"], doc["source"]))
         else:
             faq_url = "https://storage.googleapis.com/benchmarks-artifacts/travel-db/swiss_faq.md"
 
@@ -495,7 +597,14 @@ class VectorDB:
                     raise
 
             # 先按标题将 FAQ 拆成多个文档
-            initial_docs = [txt.strip() for txt in re.split(r"(?=\n##)", faq_text) if txt.strip()]
+            initial_docs = [
+                {
+                    "page_content": txt.strip(),
+                    "source": faq_url,
+                    "type": "faq",
+                }
+                for txt in re.split(r"(?=\n##)", faq_text) if txt.strip()
+            ]
 
         logger.info(f"📋 FAQ 初步拆分为 {len(initial_docs)} 个部分")
         
@@ -503,11 +612,13 @@ class VectorDB:
         max_chunk_size = 1900  # 预留更保守的缓冲，确保文档不超过 2048
         docs = []
         
-        for i, doc_content in enumerate(initial_docs):
+        for i, initial_doc in enumerate(initial_docs):
+            doc_content = initial_doc["page_content"]
+            doc_metadata = {key: value for key, value in initial_doc.items() if key != "page_content"}
             logger.debug(f"正在处理第 {i+1} 个部分: {len(doc_content)} 个字符")
             
             if len(doc_content) <= max_chunk_size:
-                docs.append({"page_content": doc_content})
+                docs.append({"page_content": doc_content, **doc_metadata})
             else:
                 logger.info(f"第 {i+1} 个部分过长（{len(doc_content)} 个字符），开始智能切分...")
                 
@@ -522,7 +633,7 @@ class VectorDB:
                     # 如果加上该段后会超限，就先保存当前分块再开始新分块
                     if len(current_chunk) + len(paragraph) + 2 > max_chunk_size:  # +2 for \n\n
                         if current_chunk:
-                            docs.append({"page_content": current_chunk.strip()})
+                            docs.append({"page_content": current_chunk.strip(), **doc_metadata})
                             chunk_count += 1
                             logger.debug(f"    已创建分块 {chunk_count}: {len(current_chunk)} 个字符")
                             current_chunk = paragraph
@@ -538,7 +649,7 @@ class VectorDB:
                                     
                                 if len(current_chunk) + len(sentence) + 1 > max_chunk_size:
                                     if current_chunk:
-                                        docs.append({"page_content": current_chunk.strip()})
+                                        docs.append({"page_content": current_chunk.strip(), **doc_metadata})
                                         chunk_count += 1
                                         logger.debug(f"      已创建句子分块 {chunk_count}: {len(current_chunk)} 个字符")
                                         current_chunk = sentence
@@ -551,14 +662,14 @@ class VectorDB:
                                         for word in words:
                                             if len(word_chunk) + len(word) + 1 > max_chunk_size:
                                                 if word_chunk:
-                                                    docs.append({"page_content": word_chunk.strip()})
+                                                    docs.append({"page_content": word_chunk.strip(), **doc_metadata})
                                                     chunk_count += 1
                                                     logger.debug(f"        已创建单词分块 {chunk_count}: {len(word_chunk)} 个字符")
                                                     word_chunk = word
                                                 else:
                                                     # 单个单词仍过长，则直接截断（极少见）
                                                     truncated = word[:max_chunk_size]
-                                                    docs.append({"page_content": truncated})
+                                                    docs.append({"page_content": truncated, **doc_metadata})
                                                     chunk_count += 1
                                                     logger.warning(f"        超长单词已截断: {len(word)} -> {len(truncated)} 个字符")
                                             else:
@@ -573,7 +684,7 @@ class VectorDB:
                 
                 # 若最后仍有内容，则补上最后一个分块
                 if current_chunk:
-                    docs.append({"page_content": current_chunk.strip()})
+                    docs.append({"page_content": current_chunk.strip(), **doc_metadata})
                     chunk_count += 1
                     logger.debug(f"    最后一个分块 {chunk_count}: {len(current_chunk)} 个字符")
                 
@@ -610,7 +721,14 @@ class VectorDB:
         logger.info(f"🤖 开始为 {len(docs)} 个 FAQ 文档生成 embedding（均保证不超过 2048 字符）...")
         
         async with aiohttp.ClientSession() as session:
-            tasks = [self.process_chunk(doc["page_content"], {"type": "faq"}, session) for doc in docs]
+            tasks = [
+                self.process_chunk(
+                    doc["page_content"],
+                    {key: value for key, value in doc.items() if key != "page_content"},
+                    session
+                )
+                for doc in docs
+            ]
 
             try:
                 points = await tqdm_asyncio.gather(*tasks, desc="正在为 FAQ 文档生成 embedding")
